@@ -1,0 +1,63 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 38 70% 98%;
+    --foreground: 196 36% 15%;
+    --card: 0 0% 100%;
+    --card-foreground: 196 36% 15%;
+    --primary: 191 72% 28%;
+    --primary-foreground: 44 80% 97%;
+    --secondary: 34 72% 92%;
+    --secondary-foreground: 196 36% 18%;
+    --muted: 188 18% 92%;
+    --muted-foreground: 194 13% 35%;
+    --accent: 19 90% 58%;
+    --accent-foreground: 40 85% 98%;
+    --border: 194 21% 82%;
+    --input: 194 21% 82%;
+    --ring: 191 72% 28%;
+    --destructive: 0 72% 52%;
+    --destructive-foreground: 40 85% 98%;
+    --font-manrope:
+      "Aptos", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    --font-space-grotesk:
+      "Bahnschrift", "Trebuchet MS", "Aptos Display", "Segoe UI", sans-serif;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply min-h-screen bg-background text-foreground;
+    background-image:
+      radial-gradient(circle at top left, rgba(244, 137, 76, 0.18), transparent 28%),
+      radial-gradient(circle at bottom right, rgba(27, 103, 119, 0.12), transparent 34%),
+      linear-gradient(180deg, rgba(255, 250, 242, 0.96), rgba(245, 248, 250, 0.98));
+    font-family: var(--font-manrope), sans-serif;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    font-family: var(--font-space-grotesk), sans-serif;
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  .range-track {
+    accent-color: hsl(var(--primary));
+  }
+}
