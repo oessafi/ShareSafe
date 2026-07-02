@@ -17,6 +17,9 @@ SPACY_LANGUAGE = "fr"
 SPACY_MODEL = "fr_core_news_md"
 
 MANUAL_REDACTION_FILL = (0, 0, 0)
+OCR_MIN_NATIVE_TEXT_LENGTH = 50
+OCR_LANGUAGE = "fra+eng"
+OCR_DPI = 300
 AUTO_REDACT_ENTITIES = (
     "PERSON",
     "LOCATION",
@@ -65,6 +68,13 @@ class PageLine:
     text: str
     rect: fitz.Rect
     font_size: float
+
+
+@dataclass(frozen=True)
+class PageTextContext:
+    text: str
+    textpage: fitz.TextPage
+    used_ocr: bool
 
 
 def build_analyzer_engine() -> AnalyzerEngine:
@@ -145,12 +155,16 @@ class RedactionService:
     def __init__(self, analyzer: AnalyzerEngine):
         self.analyzer = analyzer
 
-    def detect_page_terms(self, page: fitz.Page, mode: str) -> dict[str, str]:
-        page_text = page.get_text("text")
-        detected_terms = self._detect_terms_with_presidio(page_text)
+    def detect_page_terms(
+        self,
+        page: fitz.Page,
+        page_context: PageTextContext,
+        mode: str,
+    ) -> dict[str, str]:
+        detected_terms = self._detect_terms_with_presidio(page_context.text)
 
         if mode == "anonymous_cv":
-            lines = extract_page_lines(page)
+            lines = extract_page_lines(page, page_context.textpage)
             detected_terms.update(
                 detect_candidate_name_terms(lines, page.rect.height)
             )
@@ -181,13 +195,14 @@ class RedactionService:
     def redact_terms(
         self,
         page: fitz.Page,
+        textpage: fitz.TextPage,
         terms: Iterable[str],
         fill_color: tuple[float, float, float],
     ) -> int:
         redacted_matches = 0
 
         for term in terms:
-            for rect in find_term_rectangles(page, term):
+            for rect in find_term_rectangles(page, term, textpage):
                 page.add_redact_annot(rect, fill=fill_color)
                 redacted_matches += 1
 
@@ -384,11 +399,15 @@ def merge_rectangles(rectangles: list[fitz.Rect]) -> fitz.Rect:
     return fitz.Rect(x0, y0, x1, y1)
 
 
-def find_term_rectangles(page: fitz.Page, term: str) -> list[fitz.Rect]:
+def find_term_rectangles(
+    page: fitz.Page,
+    term: str,
+    textpage: fitz.TextPage | None = None,
+) -> list[fitz.Rect]:
     direct_matches: dict[tuple[float, float, float, float], fitz.Rect] = {}
 
     for candidate in iter_search_terms(term):
-        for rect in page.search_for(candidate):
+        for rect in page.search_for(candidate, textpage=textpage):
             key = (
                 round(rect.x0, 3),
                 round(rect.y0, 3),
@@ -405,7 +424,7 @@ def find_term_rectangles(page: fitz.Page, term: str) -> list[fitz.Rect]:
         return []
 
     line_words: dict[tuple[int, int], list[tuple[fitz.Rect, str]]] = {}
-    for raw_word in page.get_text("words", sort=True):
+    for raw_word in page.get_text("words", sort=True, textpage=textpage):
         if len(raw_word) < 8:
             continue
 
@@ -463,8 +482,11 @@ def find_term_rectangles(page: fitz.Page, term: str) -> list[fitz.Rect]:
     return list(fallback_rectangles.values())
 
 
-def extract_page_lines(page: fitz.Page) -> list[PageLine]:
-    content = page.get_text("dict", sort=True)
+def extract_page_lines(
+    page: fitz.Page,
+    textpage: fitz.TextPage | None = None,
+) -> list[PageLine]:
+    content = page.get_text("dict", sort=True, textpage=textpage)
     lines: list[PageLine] = []
 
     for block in content.get("blocks", []):
@@ -495,6 +517,47 @@ def extract_page_lines(page: fitz.Page) -> list[PageLine]:
             )
 
     return lines
+
+
+def build_page_text_context(page: fitz.Page) -> PageTextContext:
+    native_text = page.get_text("text", sort=True)
+    native_length = len(native_text.strip())
+
+    if native_length >= OCR_MIN_NATIVE_TEXT_LENGTH:
+        textpage = page.get_textpage(flags=fitz.TEXT_PRESERVE_IMAGES)
+        text = page.get_text("text", sort=True, textpage=textpage)
+        return PageTextContext(text=text, textpage=textpage, used_ocr=False)
+
+    try:
+        textpage = page.get_textpage_ocr(
+            flags=fitz.TEXT_PRESERVE_IMAGES,
+            language=OCR_LANGUAGE,
+            dpi=OCR_DPI,
+        )
+    except Exception as exc:  # pragma: no cover - depends on host OCR installation
+        raise handle_ocr_error(exc) from exc
+
+    text = page.get_text("text", sort=True, textpage=textpage)
+    return PageTextContext(text=text, textpage=textpage, used_ocr=True)
+
+
+def handle_ocr_error(exc: Exception) -> HTTPException:
+    message = str(exc).strip()
+    lowered = message.lower()
+
+    if any(keyword in lowered for keyword in ("tesseract", "ocr", "tessdata")):
+        detail = (
+            "OCR is required for this scanned page or image, but Tesseract is not "
+            "available on the host system. Install Tesseract OCR and the French/English "
+            "language packs, then retry."
+        )
+    else:
+        detail = (
+            "OCR initialization failed while processing a scanned page or image. "
+            f"Host error: {message or 'unknown OCR error'}"
+        )
+
+    return HTTPException(status_code=503, detail=detail)
 
 
 def is_probable_name_line(text: str) -> bool:
@@ -643,17 +706,65 @@ def save_redacted_document(document: fitz.Document, output_name: str, headers: d
     )
 
 
-def open_uploaded_pdf(file_bytes: bytes) -> fitz.Document:
+def resolve_image_filetype(file: UploadFile) -> str | None:
+    content_type_map = {
+        "image/png": "png",
+        "image/jpeg": "jpeg",
+        "image/jpg": "jpeg",
+        "image/webp": "webp",
+        "image/tiff": "tiff",
+        "image/bmp": "bmp",
+    }
+    if file.content_type in content_type_map:
+        return content_type_map[file.content_type]
+
+    filename = (file.filename or "").lower()
+    suffix_map = {
+        ".png": "png",
+        ".jpg": "jpeg",
+        ".jpeg": "jpeg",
+        ".webp": "webp",
+        ".tif": "tiff",
+        ".tiff": "tiff",
+        ".bmp": "bmp",
+    }
+    for suffix, filetype in suffix_map.items():
+        if filename.endswith(suffix):
+            return filetype
+
+    return None
+
+
+def open_uploaded_document(file: UploadFile, file_bytes: bytes, allow_images: bool = False) -> fitz.Document:
     try:
-        return fitz.open(stream=file_bytes, filetype="pdf")
+        filename = (file.filename or "").lower()
+        if filename.endswith(".pdf") or file.content_type in {"application/pdf", "application/octet-stream"}:
+            try:
+                return fitz.open(stream=file_bytes, filetype="pdf")
+            except Exception:
+                if not allow_images:
+                    raise
+
+        image_filetype = resolve_image_filetype(file) if allow_images else None
+        if image_filetype:
+            image_document = fitz.open(stream=file_bytes, filetype=image_filetype)
+            try:
+                pdf_bytes = image_document.convert_to_pdf()
+            finally:
+                image_document.close()
+            return fitz.open(stream=pdf_bytes, filetype="pdf")
+
+        supported = "PDF"
+        if allow_images:
+            supported = "PDF or supported image"
+        raise HTTPException(status_code=400, detail=f"The uploaded file must be a {supported}.")
     except Exception as exc:  # pragma: no cover - fitz raises multiple PDF errors
-        raise HTTPException(status_code=400, detail="Unable to open the uploaded PDF.") from exc
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(status_code=400, detail="Unable to open the uploaded document.") from exc
 
 
-def validate_pdf_upload(file: UploadFile, file_bytes: bytes) -> None:
-    if file.content_type not in {"application/pdf", "application/octet-stream"}:
-        raise HTTPException(status_code=400, detail="The uploaded file must be a PDF.")
-
+def validate_upload(file_bytes: bytes) -> None:
     if not file_bytes:
         raise HTTPException(status_code=400, detail="The uploaded file is empty.")
 
@@ -670,17 +781,23 @@ async def redact_pdf(
     fill: str | None = Form(default="black"),
 ) -> Response:
     file_bytes = await file.read()
-    validate_pdf_upload(file, file_bytes)
+    validate_upload(file_bytes)
 
     redact_terms = parse_terms(terms)
     fill_color = resolve_fill_color(fill)
     redaction_service: RedactionService = app.state.redaction_service
-    document = open_uploaded_pdf(file_bytes)
+    document = open_uploaded_document(file, file_bytes, allow_images=False)
 
     try:
         redacted_matches = 0
         for page in document:
-            redacted_matches += redaction_service.redact_terms(page, redact_terms, fill_color)
+            textpage = page.get_textpage(flags=fitz.TEXT_PRESERVE_IMAGES)
+            redacted_matches += redaction_service.redact_terms(
+                page,
+                textpage,
+                redact_terms,
+                fill_color,
+            )
 
         original_name = file.filename or "document.pdf"
         safe_name = original_name.rsplit(".", 1)[0]
@@ -701,31 +818,37 @@ async def auto_redact_pdf(
     mode: str = Form(default="standard"),
 ) -> Response:
     file_bytes = await file.read()
-    validate_pdf_upload(file, file_bytes)
+    validate_upload(file_bytes)
 
     auto_mode = parse_auto_redaction_mode(mode)
     redaction_service: RedactionService = app.state.redaction_service
-    document = open_uploaded_pdf(file_bytes)
+    document = open_uploaded_document(file, file_bytes, allow_images=True)
 
     try:
         detected_terms: dict[str, str] = {}
         visual_regions: list[fitz.Rect] = []
+        page_contexts: list[PageTextContext] = []
 
         for page_index, page in enumerate(document):
-            detected_terms.update(redaction_service.detect_page_terms(page, auto_mode))
+            page_context = build_page_text_context(page)
+            page_contexts.append(page_context)
+            detected_terms.update(
+                redaction_service.detect_page_terms(page, page_context, auto_mode)
+            )
             if auto_mode == "anonymous_cv" and page_index == 0:
                 visual_regions.extend(detect_visual_regions(page, auto_mode))
 
         if not detected_terms and not visual_regions:
             raise HTTPException(
                 status_code=400,
-                detail="No sensitive items were detected in the PDF.",
+                detail="No sensitive items were detected in the document.",
             )
 
         redacted_matches = 0
-        for page_index, page in enumerate(document):
+        for page_index, (page, page_context) in enumerate(zip(document, page_contexts)):
             redacted_matches += redaction_service.redact_terms(
                 page,
+                page_context.textpage,
                 detected_terms.values(),
                 MANUAL_REDACTION_FILL,
             )
@@ -739,7 +862,7 @@ async def auto_redact_pdf(
         if redacted_matches == 0:
             raise HTTPException(
                 status_code=400,
-                detail="Sensitive items were detected but no searchable PDF matches were found for redaction.",
+                detail="Sensitive items were detected but no searchable text matches were found for redaction.",
             )
 
         original_name = file.filename or "document.pdf"
